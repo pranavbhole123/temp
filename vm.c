@@ -29,6 +29,7 @@ seginit(void)
   lgdt(c->gdt, sizeof(c->gdt));
 }
 
+
 // Return the address of the PTE in page table pgdir
 // that corresponds to virtual address va.  If alloc!=0,
 // create any required page table pages.
@@ -52,6 +53,51 @@ walkpgdir(pde_t *pgdir, const void *va, int alloc)
     *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U;
   }
   return &pgtab[PTX(va)];
+}
+
+uint 
+num_of_PhysPages(pde_t* pgdir, uint size)
+{ 
+  int count = 0;  //use PTE_P (Present bit)
+
+  uint va = 0;
+  char *a, *last;
+  pte_t *pte;
+
+  pde_t *pde = &pgdir[PDX(va)];
+  uint pa = (uint)P2V(PTE_ADDR(*pde));
+  a = (char*)PGROUNDDOWN(va);
+  last = (char*)PGROUNDDOWN((va) + size - 1);
+  for(;;){
+
+    if((pte = walkpgdir(pgdir, a, 0)) == 0)
+      ;
+    
+    else if(*pte & PTE_P)
+      count++;
+    //*pte = pa | PTE_P;
+    
+    if(a == last)
+      break;
+
+    a += PGSIZE;
+    pa += PGSIZE;
+  }
+  return count;
+}
+
+uint 
+num_of_PTPages(pde_t* pgdir, uint size)
+{ 
+  int count = 0;  //use PTE_P (Present bit)
+
+  for(int i = 0; i < NPDENTRIES; i++){
+    if(pgdir[i] & PTE_P){
+        count++;
+    }
+  }
+
+  return count + 1;
 }
 
 // Create PTEs for virtual addresses starting at va that refer to
@@ -315,33 +361,54 @@ clearpteu(pde_t *pgdir, char *uva)
 pde_t*
 copyuvm(pde_t *pgdir, uint sz)
 {
-  pde_t *d;
   pte_t *pte;
-  uint pa, i, flags;
-  char *mem;
 
-  if((d = setupkvm()) == 0)
+  uint flags, pa;
+  //char *mem;
+  
+  pde_t *d = setupkvm();
+
+  if(d == 0)
     return 0;
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
-      panic("copyuvm: pte should exist");
-    if(!(*pte & PTE_P))
-      panic("copyuvm: page not present");
-    pa = PTE_ADDR(*pte);
+
+  for(uint i = 0; i < sz; i = i + PGSIZE)
+  {
+      if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
+        panic("copyuvm: pte should exist");
+    
+      if(!(*pte & PTE_P))
+        panic("copyuvm: page not present");
+
+    *pte = (~ PTE_W) & *pte;  // read only parent page
+
     flags = PTE_FLAGS(*pte);
+
+    pa = PTE_ADDR(*pte);
+
+    /*flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
       goto bad;
     memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+    */
+
+    if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0) 
+    {
+      //kfree(mem);
+        freevm(d);
+        lcr3(V2P(pgdir));   // flush tlb
+        
+        return 0;
+    
     }
+
+    increment_refC(pa);
+
   }
+
+  lcr3(V2P(pgdir));   // flush tlb
+
   return d;
 
-bad:
-  freevm(d);
-  return 0;
 }
 
 //PAGEBREAK!
@@ -391,4 +458,84 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
 // Blank page.
 //PAGEBREAK!
 // Blank page.
+
+// COW trap handling
+void COW_handle_pgfault(uint err_code)
+{ 
+
+    uint va = rcr2();       // get va
+
+  //errors taken care of
+  if(myproc() == 0)     // null process
+  { 
+      cprintf("Error in COW_handle_pgfault: No user process from cpu %d, cr2=0x%x\n", cpuid(), va); //va = rcr2()
+      panic("Page_Fault");
+  }
+
+  pte_t *pte;
+
+  pte = walkpgdir(myproc()->pgdir, (void*)va, 0);
+
+  // page has write perm_S enabled
+    if(PTE_W & *pte)
+    {
+        cprintf("error code: %x, addr 0x%x\n", err_code, va);
+      
+        panic("Error in COW_handle_pgfault: Already writeable");
+    }
+
+  if( pte == 0  || !(*pte) || va >= KERNBASE || !PTE_U || ! PTE_P )
+  { 
+      myproc()->killed = 1;
+      cprintf("Error in COW_handle_pgfault: Illegal (virtual) addr on cpu %d address 0x%x, killing proc %s id (pid) %d\n", cpuid(), va, myproc()->name, myproc()->pid);
+
+      return;
+  }
+
+    uint pa = PTE_ADDR(*pte);                     //get physical addr
+    uint refC = get_refC(pa);                // get ref. count of curr. page
+
+    if(refC < 1)
+    {
+        panic("Error in COW_handle_pgfault: Incorrect Reference Count");
+    }
+
+    else if(refC == 1)
+    {
+        *pte = PTE_W | *pte;   // writable now since alone 
+        
+        //flush tlb because PTEs changed
+        lcr3(V2P(myproc()->pgdir));
+        return;
+    }
+
+    else                       //refC > 1
+    {
+        //try for new page
+        char* mem = kalloc();
+
+        if(mem != 0)  // page available
+        {   
+          memmove(mem, (char*)P2V(pa), PGSIZE); // from line 387
+
+          // new PTE to new page
+          *pte =  PTE_U | PTE_W | PTE_P | V2P(mem);
+
+          decrement_refC(pa);
+
+          //flush tlb because PTEs changed
+          lcr3(V2P(myproc()->pgdir));
+          return;
+        }
+
+        myproc()->killed = 1;
+
+        cprintf("Error in COW_handle_pgfault: Out of memory, kill proc %s with pid %d\n", myproc()->name, myproc()->pid);          
+        return;
+
+    }
+
+    //flush tlb because PTEs changed
+    lcr3(V2P(myproc()->pgdir));
+}
 

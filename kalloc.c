@@ -21,6 +21,10 @@ struct {
   struct spinlock lock;
   int use_lock;
   struct run *freelist;
+  uint num_free_pages;  //store number of free pages
+  uint page_refC[PHYSTOP >> PGSHIFT];
+
+
 } kmem;
 
 // Initialization happens in two phases.
@@ -33,6 +37,7 @@ kinit1(void *vstart, void *vend)
 {
   initlock(&kmem.lock, "kmem");
   kmem.use_lock = 0;
+  kmem.num_free_pages = 0;
   freerange(vstart, vend);
 }
 
@@ -49,7 +54,10 @@ freerange(void *vstart, void *vend)
   char *p;
   p = (char*)PGROUNDUP((uint)vstart);
   for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
+  { 
+    kmem.page_refC[V2P(p) >> PGSHIFT] = 0;          // initialse the reference count to 0
     kfree(p);
+  }
 }
 //PAGEBREAK: 21
 // Free the page of physical memory pointed at by v,
@@ -65,13 +73,24 @@ kfree(char *v)
     panic("kfree");
 
   // Fill with junk to catch dangling refs.
-  memset(v, 1, PGSIZE);
+  //memset(v, 1, PGSIZE);
 
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = (struct run*)v;
-  r->next = kmem.freelist;
-  kmem.freelist = r;
+
+  if(kmem.page_refC[V2P(v) >> PGSHIFT] > 0)         // decrease reference count of page when freed
+    kmem.page_refC[V2P(v) >> PGSHIFT] = kmem.page_refC[V2P(v) >> PGSHIFT] - 1;
+
+  if(kmem.page_refC[V2P(v) >> PGSHIFT] == 0){       // Free page only if no references to the page
+    
+    memset(v, 1, PGSIZE);     // Fill garbage to catch dangling refs.
+    r->next = kmem.freelist;
+    kmem.num_free_pages = kmem.num_free_pages + 1;
+    kmem.freelist = r;
+    
+  }
+
   if(kmem.use_lock)
     release(&kmem.lock);
 }
@@ -86,11 +105,77 @@ kalloc(void)
 
   if(kmem.use_lock)
     acquire(&kmem.lock);
+  
   r = kmem.freelist;
+
   if(r)
-    kmem.freelist = r->next;
+  {
+      kmem.freelist = r->next;
+      
+      kmem.page_refC[V2P((char*)r) >> PGSHIFT] = 1;     // reference count page = one when allocated
+
+      kmem.num_free_pages = kmem.num_free_pages - 1;
+  }
+
   if(kmem.use_lock)
     release(&kmem.lock);
+  
+
   return (char*)r;
 }
+
+void increment_refC(uint pa)
+{
+  if(pa >= PHYSTOP || pa < (uint)V2P(end))
+    panic("incrementReferenceCount"); 
+
+  acquire(&kmem.lock);
+
+  kmem.page_refC[pa >> PGSHIFT] = kmem.page_refC[pa >> PGSHIFT] + 1;
+
+  release(&kmem.lock);
+
+}
+
+uint 
+num_of_FreePages(void)
+{
+  acquire(&kmem.lock);
+
+  uint num_free_pages = kmem.num_free_pages;
+  
+  release(&kmem.lock);
+  
+  return num_free_pages;
+}
+
+void decrement_refC(uint pa)
+{
+  if(pa >= PHYSTOP || pa < (uint)V2P(end))
+    panic("decrementReferenceCount"); 
+
+  acquire(&kmem.lock);
+
+  kmem.page_refC[pa >> PGSHIFT] = kmem.page_refC[pa >> PGSHIFT] - 1;
+  
+  release(&kmem.lock);
+
+}
+
+uint get_refC(uint pa)
+{
+  if( pa >= PHYSTOP || pa < (uint)V2P(end))
+    panic("getReferenceCount"); 
+
+  uint count;
+
+  acquire(&kmem.lock);
+
+  count = kmem.page_refC[pa >> PGSHIFT];
+  
+  release(&kmem.lock);
+
+  return count;
+
+} 
 

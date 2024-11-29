@@ -8,6 +8,34 @@
 #include "proc.h"
 
 int
+sys_getNumFreePages(void)
+{
+  return num_of_FreePages();  
+}
+
+int
+sys_getNumVirtPages(void)
+{
+  int size = myproc()->sz;
+
+  return size%4096==0 ? size/4096 : size/4096 + 1; //size in bytes divided by number of pages
+}
+
+int
+sys_getNumPhysPages(void)
+{
+  
+  return num_of_PhysPages(myproc()->pgdir, myproc()->sz);
+}
+
+int
+sys_getNumPTPages(void)
+{ 
+
+  return num_of_PTPages(myproc()->pgdir, myproc()->sz);
+}
+
+int
 sys_fork(void)
 {
   return fork();
